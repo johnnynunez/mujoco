@@ -1,0 +1,117 @@
+# Fork-only CI: native Windows ARM64 CPU Python wheels.
+#
+# Upstream does not officially support Windows on ARM, so this workflow lives in
+# this fork only (see google-deepmind/mujoco#3682). It only adds new files, so
+# syncing the fork with upstream main never conflicts with it.
+#
+# * push / pull_request: build this fork's own tree.
+# * schedule / workflow_dispatch (source=upstream): build google-deepmind/mujoco
+#   main with this fork's CI helpers, so upstream regressions on Windows ARM64
+#   show up here and can be reported or fixed upstream.
+
+name: windows-arm64
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "doc/**"
+      - "**/README.md"
+  pull_request:
+    paths-ignore:
+      - "doc/**"
+      - "**/README.md"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source tree to build"
+        type: choice
+        options:
+          - upstream
+          - fork
+        default: upstream
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-arm64:
+    name: "windows-11-arm / CPython ${{ matrix.python }}"
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # CPython 3.10 is not included: NumPy has no Windows ARM64 wheels for it.
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t", "3.15", "3.15t"]
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "3"
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        persist-credentials: false
+    - name: Check out upstream main
+      if: github.event_name == 'schedule' || inputs.source == 'upstream'
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        repository: google-deepmind/mujoco
+        ref: main
+        path: upstream
+        persist-credentials: false
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      with:
+        python-version: ${{ matrix.python }}
+        architecture: arm64
+    - name: Select source tree and isolated native build workspace
+      shell: pwsh
+      run: |
+        $source = $env:GITHUB_WORKSPACE
+        if (Test-Path upstream) {
+          # Build upstream main with this fork's CI helpers.
+          Copy-Item -Path .github/workflows/windows_arm64.py, .github/workflows/audit_windows_arm64_wheel.py -Destination upstream/.github/workflows/
+          Copy-Item -Path python/setup_test.py -Destination upstream/python/
+          $source = Join-Path $env:GITHUB_WORKSPACE upstream
+        }
+        git -C $source log -1 --format="Building %H %s"
+        "MUJOCO_ARM64_SOURCE=$source" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "MUJOCO_ARM64_WORK=$env:RUNNER_TEMP/mujoco-arm64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    - name: Configure native ARM64 MSVC and Windows SDK
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -products * -latest -prerelease -property installationPath
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+        $before = @{}
+        Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+        $lines = cmd.exe /c "`"$vcvars`" arm64 >nul && set"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        foreach ($line in $lines) {
+          $idx = $line.IndexOf("=")
+          if ($idx -gt 0) {
+            $name = $line.Substring(0, $idx)
+            $val = $line.Substring($idx + 1)
+            if ($before[$name] -ne $val) {
+              "$name=$val" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+        }
+    - name: Install build tools
+      # --upgrade: the 3.11 interpreter ships a setuptools too old for PEP 639.
+      run: python -m pip install --upgrade cmake ninja setuptools wheel build absl-py "zstandard; python_version < '3.14'"
+    - name: Build, audit, and test native CPU wheels
+      run: python "$env:MUJOCO_ARM64_SOURCE/.github/workflows/windows_arm64.py"
+    - name: Upload native wheel and test results
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: windows-arm64-cp${{ matrix.python }}
+        path: |
+          ${{ env.MUJOCO_ARM64_WORK }}/package/dist/*.whl
+          ${{ env.MUJOCO_ARM64_WORK }}/tests.xml
